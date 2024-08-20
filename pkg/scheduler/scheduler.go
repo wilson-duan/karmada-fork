@@ -24,7 +24,11 @@ import (
 	"reflect"
 	"strings"
 	"time"
+	"bytes"
+	"net/http"
+	"io"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -584,6 +588,247 @@ func (s *Scheduler) scheduleResourceBindingWithClusterAffinities(rb *workv1alpha
 	return scheduleErr
 }
 
+func isSts(stsBinding *workv1alpha2.ResourceBinding) bool {
+	kind := stsBinding.Spec.Resource.Kind
+	return kind == "StatefulSet"
+}
+
+func isMMSts(sts appsv1.StatefulSet) bool {
+	// see schema_k8sio_api_core_v1_PodTemplateSpec function for what templateSpec looks like
+	labels := sts.Spec.Template.ObjectMeta.Labels
+	for key, val := range labels {
+		klog.V(4).Infof("key: %s, value: %s\n", key, val)
+		if key == "mmcloud.io/checkpoint-mode" && val == "true" {
+			return true
+		}
+	}
+	return false
+}
+
+func getMMPVC(sts appsv1.StatefulSet, pvcList corev1.PersistentVolumeClaimList) *corev1.PersistentVolumeClaim {
+	pvcMMName := "pod-" + sts.Name + "-0-mmc-checkpoint"
+	for _, pvc := range pvcList.Items {
+		if pvc.Name == pvcMMName {
+			return &pvc
+		}
+	}
+	return nil
+}
+
+func getMMPV(pvc corev1.PersistentVolumeClaim, pvList corev1.PersistentVolumeList) *corev1.PersistentVolume {
+	pvMMName := pvc.Spec.VolumeName
+	for _, pv := range pvList.Items {
+		if pv.Name == pvMMName {
+			return &pv
+		}
+	}
+	return nil
+}
+
+func (s *Scheduler) fetchResource(apiPath string) ([]byte, error) {
+    data, err := s.KarmadaClient.SearchV1alpha1().RESTClient().Get().AbsPath(apiPath).DoRaw(context.TODO())
+    if err != nil {
+        klog.Errorf("Error retrieving resource from %s: %s\n", apiPath, err)
+        return nil, err
+    }
+    // klog.V(4).Infof("Fetched resource from %s: %s\n", apiPath, string(data))
+    return data, nil
+}
+
+func (s *Scheduler) retrieveMMInfo() (*appsv1.StatefulSetList, *corev1.PersistentVolumeClaimList, *corev1.PersistentVolumeList, *corev1.ServiceList, error) {
+    stsApiPath := "/apis/apps/v1/statefulsets"
+	pvcApiPath := "/apis/search.karmada.io/v1alpha1/search/cache/api/v1/persistentvolumeclaims"
+	pvApiPath := "/apis/search.karmada.io/v1alpha1/search/cache/api/v1/persistentvolumes"
+	svcApiPath := "/apis/search.karmada.io/v1alpha1/search/cache/api/v1/services"
+
+    // Retrieve resources using the Karmada Search API
+	stsSearchResults, err := s.fetchResource(stsApiPath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	pvcSearchResults, err := s.fetchResource(pvcApiPath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	pvSearchResults, err := s.fetchResource(pvApiPath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	svcSearchResults, err := s.fetchResource(svcApiPath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	// Unmarshal search result byte array into objects
+	stsList := appsv1.StatefulSetList{}
+	pvcList := corev1.PersistentVolumeClaimList{}
+	pvList := corev1.PersistentVolumeList{}
+	svcList := corev1.ServiceList{}
+
+	err = json.Unmarshal(stsSearchResults, &stsList)
+	if err != nil {
+		klog.Errorf("Error unmarshalling STSs: %s", err)
+	}
+	err = json.Unmarshal(pvcSearchResults, &pvcList)
+	if err != nil {
+		klog.Errorf("Error unmarshalling PVCs: %s", err)
+	}
+	err = json.Unmarshal(pvSearchResults, &pvList)
+	if err != nil {
+		klog.Errorf("Error unmarshalling PVs: %s", err)
+	}
+	err = json.Unmarshal(svcSearchResults, &svcList)
+	if err != nil {
+		klog.Errorf("Error unmarshalling SVCs: %s", err)
+	}
+
+	klog.V(4).Infof("-------------------Printing unmarshalled items-------------------")
+	// Print the items
+	for _, sts := range stsList.Items {
+		klog.V(4).Infof("Found StatefulSet with Name: %s\n", sts.Name)
+	}
+
+	for _, pvc := range pvcList.Items {
+		klog.V(4).Infof("Found PersistentVolumeClaim with Name: %s\n", pvc.Name)
+	}
+
+	for _, pv := range pvList.Items {
+		klog.V(4).Infof("Found PersistentVolume with Name: %s\n", pv.Name)
+	}
+
+	for _, svc := range svcList.Items {
+		klog.V(4).Infof("Found Service with Name: %s\n", svc.Name)
+	}
+
+	klog.V(4).Infof("-------------------Done printing unmarshalled items-------------------")
+
+	return &stsList, &pvcList, &pvList, &svcList, nil
+}
+
+func isFailover(clusterList *clusterv1alpha1.ClusterList, oldBinding *workv1alpha2.ResourceBinding, scheduleResult []workv1alpha2.TargetCluster) bool {
+	for _, cluster := range clusterList.Items {
+		if oldBinding.Spec.ClusterInGracefulEvictionTasks(cluster.Name) {
+			return true
+		}
+	}
+
+	currentClusters := oldBinding.Spec.Clusters
+	for _, currentCluster := range currentClusters {
+		found := false
+		for _, scheduledCluster := range scheduleResult {
+			if currentCluster.Name == scheduledCluster.Name {
+				found = true
+			}
+		}
+		if !found {
+			return true
+		}
+	}
+	return false
+}
+
+func makeRequest(url string, pvcName string, nfsPath string, capacity string) {
+	// Define the data structure to match the JSON payload
+	type PVCRequest struct {
+		Name     string `json:"name"`
+		Path     string `json:"path"`
+		Capacity string `json:"capacity"`
+	}
+
+	// Create an instance of the data structure with the appropriate values
+	requestData := PVCRequest{
+		Name: pvcName,
+		Path: nfsPath,
+		Capacity: capacity,
+	}
+
+	// Marshal the data structure into JSON
+	jsonData, err := json.Marshal(requestData)
+	if err != nil {
+		klog.Errorf("Error marshalling JSON: %v\n", err)
+		return
+	}
+
+	// Create a new HTTP POST request with the JSON payload
+	// url := "http://pv-pvc-creator.default.svc.cluster.local/create-pv-pvc"
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		klog.Errorf("Error creating request: %v\n", err)
+		return
+	}
+
+	// Set the content type header to application/json
+	req.Header.Set("Content-Type", "application/json")
+
+	// Send the request using the http.DefaultClient
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		klog.Errorf("Error sending request: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Check the response status code
+	if resp.StatusCode != http.StatusCreated {
+		klog.Errorf("Request failed with status code: %d\n", resp.StatusCode)
+		return
+	}
+
+	// Read and print the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		klog.Errorf("Error reading response body: %v\n", err)
+		return
+	}
+
+	klog.V(4).Infof("Request sent successfully, response body: %s\n", body)
+}
+
+func parseServiceList(svcList *corev1.ServiceList) map[string]string {
+	portNumbers := make(map[string]string)
+	for _, svc := range svcList.Items {
+		substr := "-pv-pvc-creator"
+		if len(svc.Name) > len(substr) && svc.Name[len(svc.Name)-len(substr):] == substr {
+			clusterName := svc.Name[:len(svc.Name)-len(substr)]
+			for _, port := range svc.Spec.Ports {
+				// see schema_k8sio_api_core_v1_ServicePort
+				nodePortString := fmt.Sprintf("%d", port.NodePort)
+				portNumbers[clusterName] = nodePortString
+			}
+		}
+	}
+	return portNumbers
+}
+
+func (s *Scheduler) constructEndpoints() (map[string]string, error) {
+	clusterList, err := s.KarmadaClient.ClusterV1alpha1().Clusters().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	// construct map from cluster name to ip address, used to access nodeport
+	clusterEndpoints := make(map[string]string)
+	for _, cluster := range clusterList.Items {
+		klog.V(4).Infof("Cluster: %s\n", cluster.Name)
+		klog.V(4).Infof("API Endpoint: %s\n", cluster.Spec.APIEndpoint)
+		endpoint := cluster.Spec.APIEndpoint
+		var leftIndex int
+		var rightIndex int
+		for i, char := range endpoint {
+			if (i > 2 && endpoint[i-1] == '/' && endpoint[i-2] == '/') {
+				leftIndex = i
+			} else if (i > 4 && char == ':') {
+				rightIndex = i
+			}
+		}
+		ipAddress := endpoint[leftIndex:rightIndex]
+		clusterEndpoints[cluster.Name] = ipAddress
+		klog.V(4).Infof("IP Address: %s\n", ipAddress)
+	}
+	return clusterEndpoints, nil
+}
+
 func (s *Scheduler) patchScheduleResultForResourceBinding(oldBinding *workv1alpha2.ResourceBinding, placement string, scheduleResult []workv1alpha2.TargetCluster) error {
 	newBinding := oldBinding.DeepCopy()
 	if newBinding.Annotations == nil {
@@ -599,6 +844,74 @@ func (s *Scheduler) patchScheduleResultForResourceBinding(oldBinding *workv1alph
 	if len(patchBytes) == 0 {
 		return nil
 	}
+
+	klog.V(4).Infof("-------------------Intercept Scheduling for MM-------------------\n")
+	clusterList, err := s.KarmadaClient.ClusterV1alpha1().Clusters().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	if len(oldBinding.Spec.Clusters) == 0 {
+		klog.V(4).Infof("No previous cluster assignment (New Resource)")
+	} else {
+		for _, cluster := range oldBinding.Spec.Clusters {
+			klog.V(4).Infof("Old cluster name: %s\n", cluster.Name)
+		}
+	}
+	for _, cluster := range newBinding.Spec.Clusters {
+		klog.V(4).Infof("Scheduled replica to cluster: %s\n", cluster.Name)
+	}
+
+	clusterEndpoints, err := s.constructEndpoints()
+	if err != nil {
+		return err
+	}
+
+	if isSts(oldBinding) {
+		stsList, pvcList, pvList, svcList, err := s.retrieveMMInfo()
+		if err != nil {
+			klog.Errorf("Failed to retrieve info: %s\n", err)
+		} else {
+			var stsMM appsv1.StatefulSet
+			for _, sts := range stsList.Items {
+				if sts.Name == oldBinding.Spec.Resource.Name {
+					stsMM = sts
+					break
+				}
+			}
+			if isMMSts(stsMM) && isFailover(clusterList, oldBinding, scheduleResult) {
+				klog.V(4).Infof("Initiating Failover Process\n")
+				pvc := getMMPVC(stsMM, *pvcList)
+				if pvc == nil {
+					klog.Errorf("Failed to find PVC\n")
+				} else {
+					pv := getMMPV(*pvc, *pvList)
+					if pv == nil {
+						klog.Errorf("Failed to find PV\n")
+					} else {
+						if pv.Spec.PersistentVolumeSource.NFS == nil {
+							klog.V(4).Infof("PV does not use NFS\n")
+						} else {
+							pvcName := pvc.Name
+							pvPath := pv.Spec.PersistentVolumeSource.NFS.Path
+							capacity := pv.Spec.Capacity[corev1.ResourceStorage] // see schema_apimachinery_pkg_api_resource_Quantity
+							capacityString := capacity.String()
+							klog.V(4).Infof("Found PVC with name %s, PV with path %s, and capacity with size %s\n", pvcName, pvPath, capacityString)
+
+							// for each target cluster, find service port and that cluster's API Endpoint
+							portNumbers := parseServiceList(svcList)
+							for _, cluster := range scheduleResult {
+								url := "http://" + clusterEndpoints[cluster.Name] + ":" + portNumbers[cluster.Name] + "/create-pv-pvc"
+								klog.V(4).Infof("Trying to create PV, PVC in new cluster via %s\n", url)
+								makeRequest(url, pvcName, pvPath, capacityString)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	klog.V(4).Infof("-------------------Finished Intercepting Scheduling for MM-------------------\n")
 
 	_, err = s.KarmadaClient.WorkV1alpha2().ResourceBindings(newBinding.Namespace).Patch(context.TODO(), newBinding.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
 	if err != nil {
