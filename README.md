@@ -1,4 +1,5 @@
 # Karmada
+This is my fork of Karmada, which modifies the scheduler to perform cross-cluster C/R. I do this by intercepting any application failover scheduling, and using karmada-search to find the pv-pvc-creator services on member clusters, and then sending a POST request to those services to create the PV, PVC. This way, when the statefulset is rescheduled to another cluster, it can reference this PV/PVC to restore.
 
 ![Karmada-logo](docs/images/Karmada-logo-horizontal-color.png)
 
